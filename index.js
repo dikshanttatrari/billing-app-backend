@@ -169,80 +169,76 @@ app.get("/api/bills", async (req, res) => {
 app.get("/api/analytics", async (req, res) => {
   try {
     const sevenDaysAgo = new Date();
-
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    sevenDaysAgo.setHours(0, 0, 0, 0);
 
-    const bills = await Bill.find({
-      createdAt: { $gte: sevenDaysAgo },
-    }).sort("createdAt");
+    // This runs entirely on the database server, not Node.js memory
+    const analytics = await Bill.aggregate([
+      { $match: { createdAt: { $gte: sevenDaysAgo } } },
+      {
+        $facet: {
+          // 1. Total Stats
+          totalStats: [
+            {
+              $group: {
+                _id: null,
+                totalRevenue: { $sum: "$total" },
+                totalOrders: { $sum: 1 },
+                cashSales: {
+                  $sum: { $cond: [{ $eq: ["$paymentMode", "cash"] }, "$total", 0] },
+                },
+                onlineSales: {
+                  $sum: { $cond: [{ $ne: ["$paymentMode", "cash"] }, "$total", 0] },
+                },
+              },
+            },
+          ],
+          // 2. Chart Data (Group by Day)
+          dailySales: [
+            {
+              $group: {
+                _id: { $dateToString: { format: "%d/%m", date: "$createdAt" } },
+                total: { $sum: "$total" },
+              },
+            },
+            { $sort: { _id: 1 } }, // Sort by date
+          ],
+          // 3. Top Products
+          topProducts: [
+            { $unwind: "$items" },
+            {
+              $group: {
+                _id: "$items.name",
+                qty: { $sum: "$items.qty" },
+              },
+            },
+            { $sort: { qty: -1 } },
+            { $limit: 5 },
+          ],
+        },
+      },
+    ]);
 
-    let totalRevenue = 0;
+    const result = analytics[0];
+    const stats = result.totalStats[0] || { totalRevenue: 0, totalOrders: 0, cashSales: 0, onlineSales: 0 };
 
-    let totalOrders = bills.length;
-
-    let paymentStats = { cash: 0, online: 0 };
-
-    let salesByDate = {};
-
-    let productMap = {};
-
-    for (let i = 0; i < 7; i++) {
-      const d = new Date();
-
-      d.setDate(d.getDate() - i);
-
-      const dateStr = `${d.getDate()}/${d.getMonth() + 1}`;
-
-      salesByDate[dateStr] = 0;
-    }
-
-    bills.forEach((bill) => {
-      totalRevenue += bill.total;
-
-      if (bill.paymentMode === "cash") paymentStats.cash += bill.total;
-      else paymentStats.online += bill.total;
-
-      const date = new Date(bill.createdAt);
-
-      const dateStr = `${date.getDate()}/${date.getMonth() + 1}`;
-
-      if (salesByDate[dateStr] !== undefined) {
-        salesByDate[dateStr] += bill.total;
-      }
-
-      bill.items.forEach((item) => {
-        if (!productMap[item.name]) productMap[item.name] = 0;
-
-        productMap[item.name] += item.qty;
-      });
-    });
-
-    const topProducts = Object.entries(productMap)
-
-      .map(([name, qty]) => ({ name, qty }))
-
-      .sort((a, b) => b.qty - a.qty)
-
-      .slice(0, 5);
-
-    const chartLabels = Object.keys(salesByDate).reverse();
-
-    const chartData = Object.values(salesByDate).reverse();
-
+    // Format for Frontend
     res.json({
-      totalRevenue,
-
-      totalOrders,
-
-      paymentStats,
-
-      chart: { labels: chartLabels, data: chartData },
-
-      topProducts,
+      totalRevenue: stats.totalRevenue,
+      totalOrders: stats.totalOrders,
+      paymentStats: {
+        cash: stats.cashSales,
+        online: stats.onlineSales,
+      },
+      chart: {
+        labels: result.dailySales.map(d => d._id),
+        data: result.dailySales.map(d => d.total),
+      },
+      topProducts: result.topProducts.map(p => ({ name: p._id, qty: p.qty })),
     });
-  } catch (error) {
-    console.error(error);
 
+  } catch (error) {
+    console.error("Analytics Error:", error);
     res.status(500).json({ error: "Analytics error" });
   }
 });
